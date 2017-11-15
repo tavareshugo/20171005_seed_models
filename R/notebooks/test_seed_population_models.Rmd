@@ -1,0 +1,463 @@
+---
+title: "Seed germination population threshold models"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE}
+library(tidyverse)
+library(broom)
+# Change some defaults for ggplot2
+theme_set(theme_bw())
+scale_colour_discrete <- function(...) scale_colour_brewer(palette = "Dark2")
+scale_fill_discrete <- function(...) scale_fill_brewer(palette = "Dark2")
+```
+
+## Constant-time models
+
+This is described in detail in [Bradford 1990](http://www.plantphysiol.org/content/94/2/840)
+
+An essential component of the models is that the relationship 
+between overcoming a threshold for germination and time is a constant:
+
+$\theta = [X - X_b(c)]t_c$
+
+Where:
+
+- $\theta$ is the time constant for factor X
+- $X$ is the value of X as perceived by the seed
+- $X_b(c)$ is the threshold level of a particular seed $c$
+- $t_c$ is the time that seed $c$ needs until germination
+
+In practice, we control and therefore know (or assume to know):
+
+- $t_c$ - this is the time at which we measure germination
+- $X$ - this is the level of our factor (e.g. hormone concentration)
+
+We want to estimate the properties of $X_b$, which is a distribution of seed 
+thresholds in the population. Assuming that's a normal distribution, we need to 
+estimate:
+
+- $\overline X_b$, the mean of the population threshold
+- $\sigma _{X_b}$, the standard deviation of the population threshold
+
+They give a relationship between all these variables in the following model:
+
+$probit(g) = \frac{X - \frac{\theta}{t} - \overline X_b}{\sigma_{X_b}}$
+
+By re-arranging the equation, it can be re-written as a more traditional linear 
+model:
+
+$probit(g) = \frac{1}{\sigma_{X_b}}X - \frac{1}{\sigma_{X_b}} \frac{\theta}{t} - \frac{1}{\sigma_{X_b}} X_b$
+
+and a slight rearrangement:
+
+$probit(g) =  - \frac{1}{\sigma_{X_b}} X_b + \frac{1}{\sigma_{X_b}}X - \frac{\theta}{\sigma_{X_b}} \frac{1}{t}$
+
+This is now essentially in the form: $probit(g) = \mu + \beta_1 X + \beta_2 \frac{1}{t}$
+
+Where $\mu$ is the intercept and $\beta_i$ are the coeffients estimated in the model, 
+and:
+
+$\beta_1 = \frac{1}{\sigma_{X_b}}$ and thus $\sigma_{X_b} = \frac{1}{\beta_1}$
+
+$\beta_2 = -\frac{\theta}{\sigma_{X_b}}$ and thus $\theta = \beta_2 \times \sigma_{X_b}$
+
+$\mu = - \frac{1}{\sigma_{X_b}} X_b$ and thus $X_b = - \mu \times \sigma$
+
+
+In summary, their proposed biological *time model can be expressed as a linear 
+model and the coeffients estimated from the model can be used to estimate 
+the three biological parameters: $\theta$, $X_b$ and $\sigma_{X_b}$. The latter 
+two define the mean and standard deviation of the sensitivity distribution.
+
+In practice, one could imagine there's three approaches to fit the model to the 
+data:
+
+1. Fit the cumulative germination data using a general linear model with a 
+probit link (`glm`)
+2. Similar to above, but fit probit-transformed data using a normal linear model 
+(`lm`)
+3. Fit the data to the above "probit" equation using an optimization algorithm 
+to find the three parameters of interest (`optmim`).
+
+I will trial the three approaches.
+
+
+Finnaly, for reference:
+
+- to go from probit --> original use `pnorm()`
+- to go from original --> probit use `qnorm()`
+
+See [here](http://r.789695.n4.nabble.com/Inverse-of-Probit-td4680752.html) 
+for more details.
+
+
+### Simulate data for testing model fit
+
+I start by simulating some data, such that we can test the model fitting strategies. 
+
+I base this on Fig. 3 of [Bradford 2002](http://www.plantsciences.ucdavis.edu/bradford/Bradford%20WS.pdf)
+
+```{r}
+# Make data.frame with relevant parameters
+npsi <- 6 # number of psi "treatments"
+x <- tibble(theta = 40,
+            psib50 = -1,
+            sigma_psib = 0.2,
+            psi = rep(seq(0, -1, length.out = npsi), 400),
+            t = rep(1:400, each = npsi))
+
+# Function to calculate probit(g)
+# Equation (7) of Bradford 1990 (http://www.plantphysiol.org/content/94/2/840)
+modelProbitG <- function(theta, psib50, sigma_psib, psi, t){
+  ((psi - theta/t) - psib50)/sigma_psib
+}
+
+# Add probit(g) and germination %
+# I also calculate the proportion of seeds that germinate in each day
+x <- x %>% 
+  group_by(psi) %>% arrange(t) %>% 
+  mutate(probitg = modelProbitG(theta, psib50, sigma_psib, psi, t),
+         cum_g = pnorm(probitg),
+         g = lead(cum_g)-cum_g) %>% 
+  ungroup()
+```
+
+This recreates that figure:
+
+```{r}
+p1 <- x %>% 
+  ggplot(aes(t, cum_g*100, colour = factor(psi), group = psi)) + 
+  geom_line() +
+  labs(x = "Time", y = "% cumulative germinated", colour = "External\nwater\npotential") +
+  theme_classic()
+p1
+```
+
+This can be expressed as % of lines germinated in each day, which is how we've 
+been expressing it for our data:
+
+```{r}
+p2 <- x %>% 
+  ggplot(aes(t, g*100, colour = factor(psi))) +
+  geom_line() +
+  theme_classic() +
+  labs(x = "Time", y = "% germinated")
+p2
+```
+
+Just to have an idea of the variation associated with each of these distributions, 
+we can estimate the coefficient of variation for each of these distributions, 
+based on some sample size, say 200 seeds:
+
+```{r}
+# Note at this sample size no germination occurs with Psi = -1
+x_summary <- x %>% 
+  mutate(number= round(g*200)) %>% 
+  rename(day = t) %>% 
+  group_by(psi) %>% 
+  filter(!is.na(number)) %>% 
+  summarise(mean = mean(rep(day, number)),
+            mode = mean(day[which(number == max(number))]),
+            var =  var(rep(day, number), na.rm=T),
+            sd = sqrt(var),
+            cv = sd/mean,
+            max = max(g*100))
+x_summary
+```
+
+Both figures combined for illustration:
+
+```{r}
+#png("seed_germination_models.png", width = 800, height = 400, res = 100)
+gridExtra::grid.arrange(
+  p1,
+  p2 + 
+    geom_text(data = x_summary, aes(x = mode + 30, y = max + 0.001, label = paste0("CV = ", round(cv, 3)))) +
+    theme(legend.position = "none") + 
+    annotate(geom = "text", x = 300, y = 4, label = "CV calculated from\nn = 200"),
+  ncol = 2
+)
+#dev.off()
+```
+
+
+## Fitting models to data
+
+Let's now try to fit the seed population models. 
+
+First I simulate some data with noise from the above theoretical model. 
+I do this by adding some noise to the probit(g) values (noise from a normal 
+distribution with mean 0):
+
+```{r}
+set.seed(1222) # for reproducibility
+
+# Keep only a few time points
+## Add some noise to data
+test <- x %>% 
+  filter(t %in% seq(1, 400, 20)) %>% 
+  #select(t, psi, probitg, g) %>% 
+  mutate(sim_probitg = probitg + rnorm(n(), sd = 0.25),
+         sim_germ = pnorm(sim_probitg))
+
+# Plot in original units
+test %>% 
+  ggplot(aes(t, sim_germ, colour = factor(psi))) + 
+  geom_point() +
+  geom_line(aes(y = cum_g)) +
+  labs(x = "Time", y = "Cumulative germinated")
+```
+
+Notice that, adding noise to the probit-transformed data actually results in 
+non-homogeneous variance in the original germination scale.
+
+This can also be expressed in probit units, in which case I plot it with 
+regards to the inverse of time (= germination rate), which becomes linear (this 
+property is what makes this transformation useful later when we fit a model to 
+these data):
+
+```{r}
+test %>% 
+  filter(t > 1) %>% 
+  ggplot(aes(1/t, sim_probitg, colour = factor(psi))) + 
+  geom_point() +
+  stat_smooth(method = "lm", se = FALSE) +
+  labs(x = "Germination rate (1/Time)", y = "probit(cumulative germinated)")
+```
+
+
+#### Using `optim` to fit the model
+
+Taking Bradford's model:
+
+$probit(g) = \frac{X - \frac{\theta}{t} - \overline X_b}{\sigma_{X_b}}$
+
+And plugging it to a function:
+
+```{r}
+# Equation (7) of Bradford 1990 (http://www.plantphysiol.org/content/94/2/840)
+modelProbitG <- function(theta, psib50, sigma_psib, psi, t){
+  ((psi - theta/t) - psib50)/sigma_psib
+}
+```
+
+We also define a function that calculates a distance between this model and a 
+fit that will be used with `optim`:
+
+```{r}
+# params = c(theta, psib50, sigma_psib)
+modelProbitDist <- function(params, data, y = "sim_probitg", dist_method = c("rmse", "lse")){
+  dif <- data[[y]] - modelProbitG(params[1], params[2], params[3], data[["psi"]], data[["t"]])
+  
+  # Output root-mean-squared-error
+  if(dist_method[1] == "rmse") return(sqrt(mean(dif^2)))
+  
+  # Output sum-squared-error
+  if(dist_method[1] == "lse") return(sum(dif^2))
+}
+```
+
+Applying our distance measure using the original (known) parameters, we get a 
+result that is very close to the standard deviation of noise added to the 
+simulated data:
+
+```{r}
+# This is how I'm calculating it in the original data
+modelProbitDist(c(40, -1, 0.2), test)
+```
+
+So now we can use this with `optim` to find the best-fitting parameters:
+
+```{r}
+test_optim <- optim(c(theta = 0, mean = 0, sigma = 1), modelProbitDist, data = test)
+test_optim
+```
+
+Which is actually not a bad estimate at all!
+
+Below I graph the simulated data, the known curves and fitted curves by this 
+method:
+
+```{r}
+test %>% 
+  ggplot(aes(t, sim_germ)) + 
+  geom_point(colour = "grey") +
+  geom_line(aes(y = cum_g, colour = "original")) + 
+  geom_line(aes(y = pnorm(modelProbitG(test_optim$par[1], test_optim$par[2], test_optim$par[3], psi, t)),
+                colour = "optim fit"), linetype = "dashed") +
+  facet_wrap(~ psi) + theme_classic()
+```
+
+
+#### Using `glm` to fit the model
+
+Using the `glm` function, the model should be expressed in the following way, 
+as demonstrated above:
+
+$probit(g) =  - \frac{1}{\sigma_{X_b}} X_b + \frac{1}{\sigma_{X_b}}X - \frac{\theta}{\sigma_{X_b}} \frac{1}{t}$
+
+Which, more simply:
+
+$probit(g) = \mu + \beta_1 X + \beta_2 \frac{1}{t}$
+
+```{r}
+# fit with glm using probit link
+test_probit <- glm(sim_germ ~ psi + I(1/t), data = test, family = binomial(link = "probit"))
+```
+
+`glm` throws a warning, implying some problem(s). But it still makes a fit, 
+probably by least squares after probit-transforming the data.
+
+The warnings here refer to two things, I think:
+
+- what we did is a wrong specification of the model, at least strictly speaking 
+of how `glm` works. It expects a 0/1 response, or something that can be converted 
+to that kind of response. In this case, we're giving it cumulative germination, 
+which doesn't map well to a binary response. We could probably resolve this 
+error by providing some number to the `weights` option, such that the response 
+would become an integer. In real data this might be the total number of seeds 
+assayed at each time point.
+- The other warning implies some over-fitting of the model, such that the response 
+was perfectly separated by our independent variables.
+
+As far as a fit is concerned, it's very close to what was obtained with the 
+`optim` approach:
+
+```{r}
+# Get predicted response from model
+predict_probit <- test %>% 
+  mutate(pred = predict(test_probit, type = "response"))
+
+# Plot alongside the original model and optim fit
+ggplot(test, aes(t, sim_germ)) + 
+  geom_point(colour = "grey") +
+  geom_line(aes(y = cum_g, colour = "original")) + 
+  geom_line(aes(y = pnorm(modelProbitG(test_optim$par[1], test_optim$par[2], test_optim$par[3], psi, t)),
+                colour = "optim fit"), linetype = "dashed") +
+  geom_line(data = predict_probit, aes(y = pred, colour = "glm fit")) +
+  facet_wrap(~ psi) + theme_classic()
+```
+
+We can convert the coefficient estimates to the "biological" parameters (the 
+convertion is detailed in the first section):
+
+```{r}
+# Function to do this conversion
+probitToSeed <- function(mod){
+  # sigma = inverse of psi estimate
+  Xsigma <- 1/mod$coefficients["psi"]
+  names(Xsigma) <- "sigma"
+  
+  # theta = -( sigma * 1/t estimate )
+  theta <- -(Xsigma * mod$coefficients["I(1/t)"])
+  names(theta) <- "theta"
+  
+  # mean = -( sigma * intercept )
+  Xbar = -(Xsigma * mod$coefficients["(Intercept)"])
+  names(Xbar) <- "mean"
+  
+  c(theta, Xbar, Xsigma)
+
+}
+probitToSeed(test_probit)
+```
+
+For comparison, this is the estimate from the `optim` approach:
+
+```{r}
+test_optim$par
+```
+
+The original parameters:
+
+```{r}
+distinct(x, psib50, sigma_psib, theta)
+```
+
+On a linear scale, this is how it looks:
+
+```{r}
+# Note I'm removing time-point 1 to make the plot more visible
+test %>% 
+  mutate(pred = predict(test_probit)) %>% 
+  filter(t > 1) %>% 
+  ggplot(aes(1/t, sim_probitg, colour = factor(psi))) + 
+  geom_point() + 
+  geom_line(aes(y = pred, linetype = "glm fit"))
+```
+
+
+#### Using `lm` on probit-transformed data
+
+Finally, we can consider to fit a normal linear model to the probit-transformed 
+germination data. 
+
+```{r}
+test_lm <- lm(sim_probitg ~ psi + I(1/t), data = test)
+```
+
+In this case, to see it on the original scale we have to back-transform the data 
+from this model (back to germination units):
+
+```{r}
+test %>% 
+  mutate(pred_glm = predict(test_probit, type = "response"),
+         pred_lm = pnorm(predict(test_lm))) %>% 
+  filter(t > 1) %>% 
+  ggplot(aes(t, sim_germ, colour = factor(psi))) + 
+  geom_point(colour = "grey") + 
+  geom_line(aes(y = cum_g, colour = "original")) + 
+  geom_line(aes(y = pred_glm, colour = "glm fit")) +
+  geom_line(aes(y = pred_lm, colour = "lm fit")) +
+  facet_wrap(~ psi) + theme_classic()
+```
+
+The predictions are slightly different to the `glm` approach, but all quite close 
+to each other:
+
+```{r}
+test_optim$par # optim approach
+probitToSeed(test_probit) # glm approach
+probitToSeed(test_lm) # lm approach
+```
+
+And finally, we can visualise it on a probit-scale in relation to germination 
+rate (1/t):
+
+```{r}
+test %>% 
+  mutate(pred_glm = predict(test_probit),
+         pred_lm = (predict(test_lm))) %>% 
+  filter(t > 1) %>% 
+  ggplot(aes(1/t, sim_probitg, colour = factor(psi))) + 
+  geom_point() + 
+  geom_line(aes(y = pred_glm, linetype = "glm")) +
+  geom_line(aes(y = pred_lm, linetype = "lm"))
+```
+
+
+## Conclusions and problems to think about
+
+- all three methods used gave reasonable fits
+- `glm` threw some warnings which we should think about
+- either `glm` or `lm` approaches seem preferable because they are more stable and 
+allow more flexibility in specifying models - for example, several genotypes can 
+be fit at once (adding another term) and interactions between terms can also be 
+tested 
+
+One problem in real data, is how to we deal with the fact that `probit(1) = Inf` 
+and `probit(0) = -Inf`? 
+
+In real data we are going to have cases where the cumulative germination is 
+either 0 or 1. In this simulated data, we obtained the probit values 
+from the model, which does not have this problem. 
+
+If we use the `glm` approach, this might not be a problem, but if we want to use 
+the `lm` or `optim` approaches, which work on probit-transformed data then we need 
+to address this.
+
